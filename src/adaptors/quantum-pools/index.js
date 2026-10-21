@@ -5,9 +5,10 @@ const utils = require('../utils');
 
 // Quantum Pools vaults custody one Uniswap V3 / PancakeSwap V3 position NFT per
 // depositor. A keeper snuggles each range (automatic rebalance) so it keeps
-// earning. There is no share token, so `token` is null and each vault is one pool.
+// earning. There is no share token, so `token` is null. One vault holds many
+// underlying pools, so each DefiLlama row is one vault plus one V3 pool.
 //
-// tvlUsd is the vault's NFTs unwrapped at the current pool price.
+// tvlUsd is that pool's NFTs inside the vault, unwrapped at the current price.
 //
 // apyBase is depositor-net trading fees annualised over the time they actually
 // accrued. The keeper settles several days of fees in one FeesCollected event, so
@@ -18,12 +19,16 @@ const utils = require('../utils');
 // position's first collection. Collections less than 6 hours apart are one
 // keeper run (a dust follow-up must not be annualised on its own). A gap
 // shorter than a day is skipped. Fees still uncollected, and settlements with
-// no observable start, are left out, so the rate is a lower bound.
+// no observable start, are left out, so the rate is a lower bound. Annualised
+// fees of the NFTs in one underlying pool are summed and divided by that
+// pool's TVL.
 //
 //   net = FeesCollected − FeeTaxed (cut0, cut1)
 // FeesCollected is emitted in `_collectFees()` before any decreaseLiquidity, so
 // it is fees only. FeesHarvested repeats those amounts and is not read.
 const PROJECT = 'quantum-pools';
+const PROJECT_URL = 'https://quantumpools.io';
+const ZERO = '0x0000000000000000000000000000000000000000';
 const DAY = 24 * 60 * 60;
 const YEAR = 365 * DAY;
 const LOOKBACK_DAYS = 14;
@@ -128,6 +133,9 @@ const amountsFor = (liquidity, sqrtPriceX96, tickLower, tickUpper) => {
 };
 
 const asNumber = (value) => Number(value.toString());
+
+// Uniswap V3 fee is hundredths of a bip: 500 = 0.05%, 3000 = 0.3%, 10000 = 1%.
+const feeTier = (fee) => `${Number((Number(fee) / 1e4).toFixed(4))}%`;
 
 // The SDK widens each getLogs span and can repeat a boundary block when it
 // splits a range. Count each log once.
@@ -329,10 +337,10 @@ const annualisedFees = (points, createdTs) => {
   return 0;
 };
 
-const vaultPool = async ({ chain, vault, npm, dex, version }) => {
+const vaultPools = async ({ chain, vault, npm, version }) => {
   const api = new sdk.ChainApi({ chain });
   const ids = await api.call({ target: vault, abi: abi.allTokenIds });
-  if (!ids.length) return null;
+  if (!ids.length) return [];
 
   const positions = await api.multiCall({
     target: npm,
@@ -367,28 +375,42 @@ const vaultPool = async ({ chain, vault, npm, dex, version }) => {
     (asNumber(raw) / 10 ** decimalsOf[token]) * (pricesByAddress[token] || 0);
 
   const tokenOf = {};
-  const valueBy = {};
+  const poolOf = {};
+  const groups = new Map();
   const unpriced = new Set();
-  let tvlUsd = 0;
   positions.forEach((position, i) => {
+    const underlying = String(pools[i] || '').toLowerCase();
+    if (!underlying || underlying === ZERO) return;
     const token0 = position.token0.toLowerCase();
     const token1 = position.token1.toLowerCase();
-    tokenOf[String(ids[i])] = [token0, token1];
+    const id = String(ids[i]);
+    tokenOf[id] = [token0, token1];
+    poolOf[id] = underlying;
     const [amount0, amount1] = amountsFor(
       position.liquidity,
       slots[i].sqrtPriceX96,
       Number(position.tickLower),
       Number(position.tickUpper)
     );
+    let tvl = 0;
     [
       [token0, amount0],
       [token1, amount1],
     ].forEach(([token, amount]) => {
       if (amount > 0 && !pricesByAddress[token]) unpriced.add(symbolOf[token]);
-      const value = usd(token, amount);
-      valueBy[token] = (valueBy[token] || 0) + value;
-      tvlUsd += value;
+      tvl += usd(token, amount);
     });
+    if (!groups.has(underlying)) {
+      groups.set(underlying, {
+        underlying,
+        token0,
+        token1,
+        fee: Number(position.fee),
+        tvlUsd: 0,
+        annualisedUsd: 0,
+      });
+    }
+    groups.get(underlying).tvlUsd += tvl;
   });
   if (unpriced.size) {
     console.error(
@@ -456,35 +478,31 @@ const vaultPool = async ({ chain, vault, npm, dex, version }) => {
     }
   });
 
-  let annualisedUsd = 0;
   for (const [id, points] of pointsOf) {
+    const group = groups.get(poolOf[id]);
+    if (!group) continue;
     points.sort((a, b) => a.ts - b.ts);
-    annualisedUsd += annualisedFees(points, createdTs.get(id));
+    group.annualisedUsd += annualisedFees(points, createdTs.get(id));
   }
 
-  const symbol = utils.formatSymbol(
-    Object.entries(valueBy)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 3)
-      .map(([token]) => symbolOf[token])
-      .join('-')
-  );
-
-  return {
-    pool: `${vault}-${chain}`.toLowerCase(),
-    chain: utils.formatChain(chain),
-    project: PROJECT,
-    symbol,
-    tvlUsd,
-    apyBase: tvlUsd > 0 ? (annualisedUsd / tvlUsd) * 100 : 0,
-    underlyingTokens: tokens,
-    poolMeta: `${version} vault, managed ${dex} positions, ${ids.length} range${
-      ids.length === 1 ? '' : 's'
-    }, auto-snuggle`,
-    url: 'https://app.quantumpools.io',
-    // Per-depositor NFTs, no ERC-20 / ERC-4626 receipt. Opt out of pool-id extraction.
-    token: null,
-  };
+  return [...groups.values()]
+    .filter((group) => group.tvlUsd > 0)
+    .map((group) => ({
+      pool: `${vault}-${group.underlying}-${chain}`.toLowerCase(),
+      chain: utils.formatChain(chain),
+      project: PROJECT,
+      symbol: utils.formatSymbol(
+        `${symbolOf[group.token0]}-${symbolOf[group.token1]}`
+      ),
+      tvlUsd: group.tvlUsd,
+      apyBase:
+        group.tvlUsd > 0 ? (group.annualisedUsd / group.tvlUsd) * 100 : 0,
+      underlyingTokens: [group.token0, group.token1],
+      poolMeta: `${feeTier(group.fee)} fee tier, QuantumPools ${version}`,
+      url: PROJECT_URL,
+      // Per-depositor NFTs, no ERC-20 / ERC-4626 receipt. Opt out of pool-id extraction.
+      token: null,
+    }));
 };
 
 const apy = async () => {
@@ -495,8 +513,8 @@ const apy = async () => {
   let failed = 0;
   for (const vault of VAULTS) {
     try {
-      const pool = await vaultPool(vault);
-      if (pool) pools.push(pool);
+      const rows = await vaultPools(vault);
+      if (rows.length) pools.push(...rows);
     } catch (error) {
       failed += 1;
       const reason =
@@ -517,5 +535,5 @@ module.exports = {
   protocolId: '8856',
   timetravel: false,
   apy,
-  url: 'https://app.quantumpools.io',
+  url: PROJECT_URL,
 };
